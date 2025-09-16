@@ -5,19 +5,30 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Set
 
-from .base import BaseFetcher
-from .config import EnvKeys, Sources
+import requests
+
 from .common import (
+    DEFAULT_START,
+    ensure_directories,
     format_datetime,
+    load_state,
     new_ingest_timestamp,
     normalise_text,
     parse_datetime,
+    save_state,
+    write_jsonl,
 )
 
 logger = logging.getLogger(__name__)
-GRAPHQL_QUERY_TEMPLATE = """
-query($cursor: String) {{
-  securityAdvisories(first: {page_size}, orderBy: {{field: UPDATED_AT, direction: DESC}}, after: $cursor) {{
+API_URL = "https://api.github.com/graphql"
+STATE_NAME = "github"
+STATE_LAST_UPDATED = "last_updated"
+STATE_LAST_IDS = "last_ids"
+PAGE_SIZE = 100
+REQUEST_TIMEOUT = 60
+GRAPHQL_QUERY = """
+query($cursor: String) {
+  securityAdvisories(first: %d, orderBy: {field: UPDATED_AT, direction: DESC}, after: $cursor) {
     nodes {
       ghsaId
       cveId
@@ -54,42 +65,36 @@ query($cursor: String) {{
     }
   }
 }
-"""
+""" % PAGE_SIZE
 
 
-class GitHubFetcher(BaseFetcher):
-    CONFIG = Sources.GITHUB
-
+class GitHubFetcher:
     def __init__(self) -> None:
-        token = os.environ.get(EnvKeys.GITHUB_TOKEN)
+        ensure_directories()
+        token = os.environ.get("GITHUB_TOKEN")
         if not token:
             raise RuntimeError("GITHUB_TOKEN environment variable is required")
-        super().__init__(self.CONFIG)
-        self.session.headers.update({"Authorization": f"bearer {token}"})
-        self.last_updated = self.get_last_timestamp()
-        self.last_ids: Set[str] = self.get_last_ids()
-        self.query = GRAPHQL_QUERY_TEMPLATE.format(
-            page_size=self.config.page_size or 100,
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "Authorization": f"bearer {token}",
+                "User-Agent": "security-fetcher/0.1",
+            }
         )
+        self.state = load_state(STATE_NAME)
+        self.last_updated = parse_datetime(self.state.get(STATE_LAST_UPDATED)) or DEFAULT_START
+        self.last_ids: Set[str] = set(self.state.get(STATE_LAST_IDS, []))
 
     def run(self) -> int:
-        logger.info(
-            "Starting %s fetch from %s",
-            self.source_name.upper(),
-            format_datetime(self.last_updated),
-        )
+        logger.info("Starting GitHub fetch from %s", format_datetime(self.last_updated))
         records: List[Dict[str, Any]] = []
         max_updated = self.last_updated
         max_ids: Set[str] = set()
         cursor: Optional[str] = None
 
         while True:
-            payload = {"query": self.query, "variables": {"cursor": cursor}}
-            response = self.session.post(
-                self.config.api_url,
-                json=payload,
-                timeout=self.config.request_timeout,
-            )
+            payload = {"query": GRAPHQL_QUERY, "variables": {"cursor": cursor}}
+            response = self.session.post(API_URL, json=payload, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             data = response.json()
             if "errors" in data:
@@ -123,13 +128,11 @@ class GitHubFetcher(BaseFetcher):
             cursor = page_info.get("endCursor")
 
         if records:
-            self.append_records(records)
-            self.persist_state(timestamp=max_updated, ids=max_ids)
-        logger.info(
-            "Finished %s fetch with %s new records",
-            self.source_name.upper(),
-            len(records),
-        )
+            write_jsonl(STATE_NAME, records)
+            self.state[STATE_LAST_UPDATED] = format_datetime(max_updated)
+            self.state[STATE_LAST_IDS] = sorted(id_ for id_ in max_ids if id_)
+            save_state(STATE_NAME, self.state)
+        logger.info("Finished GitHub fetch with %s new records", len(records))
         return len(records)
 
     def _transform(self, node: Dict[str, Any]) -> Dict[str, Any]:
@@ -167,7 +170,7 @@ class GitHubFetcher(BaseFetcher):
 
         record_id = cve_id or ghsa_id
         return {
-            "source": self.source_name,
+            "source": STATE_NAME,
             "id": record_id,
             "title": normalise_text(node.get("summary")) or record_id,
             "description": normalise_text(node.get("description")) or normalise_text(node.get("summary")),

@@ -2,49 +2,54 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Any, Dict, List, Optional, Set
 
-from .base import BaseFetcher
-from .config import Sources
+import requests
+
 from .common import (
+    DEFAULT_START,
+    ensure_directories,
     format_datetime,
+    load_state,
     new_ingest_timestamp,
     normalise_text,
     parse_datetime,
+    save_state,
+    write_jsonl,
 )
 
 logger = logging.getLogger(__name__)
-class OSVFetcher(BaseFetcher):
-    CONFIG = Sources.OSV
+API_URL = "https://api.osv.dev/v1/vulns"
+STATE_NAME = "osv"
+STATE_LAST_MODIFIED = "last_modified"
+STATE_LAST_IDS = "last_ids"
+PAGE_SIZE = 100
+REQUEST_TIMEOUT = 60
 
+
+class OSVFetcher:
     def __init__(self) -> None:
-        super().__init__(self.CONFIG)
-        self.last_modified = self.get_last_timestamp()
-        self.last_ids: Set[str] = self.get_last_ids()
+        ensure_directories()
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "security-fetcher/0.1"})
+        self.state = load_state(STATE_NAME)
+        self.last_modified = parse_datetime(self.state.get(STATE_LAST_MODIFIED)) or DEFAULT_START
+        self.last_ids: Set[str] = set(self.state.get(STATE_LAST_IDS, []))
 
     def run(self) -> int:
-        logger.info(
-            "Starting %s fetch from %s",
-            self.source_name.upper(),
-            format_datetime(self.last_modified),
-        )
+        logger.info("Starting OSV fetch from %s", format_datetime(self.last_modified))
         records: List[Dict[str, Any]] = []
         max_modified = self.last_modified
         max_ids: Set[str] = set()
         page_token: Optional[str] = None
-        page_size = self.config.page_size or 100
 
         while True:
-            params: Dict[str, Any] = {"page_size": page_size}
+            params: Dict[str, Any] = {"page_size": PAGE_SIZE}
             if page_token:
                 params["page_token"] = page_token
             params["modified_since"] = format_datetime(self.last_modified - timedelta(minutes=1))
-            response = self.session.get(
-                self.config.api_url,
-                params=params,
-                timeout=self.config.request_timeout,
-            )
+            response = self.session.get(API_URL, params=params, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             data = response.json()
             vulns = data.get("vulns") or data.get("results") or []
@@ -72,13 +77,11 @@ class OSVFetcher(BaseFetcher):
                 break
 
         if records:
-            self.append_records(records)
-            self.persist_state(timestamp=max_modified, ids=max_ids)
-        logger.info(
-            "Finished %s fetch with %s new records",
-            self.source_name.upper(),
-            len(records),
-        )
+            write_jsonl(STATE_NAME, records)
+            self.state[STATE_LAST_MODIFIED] = format_datetime(max_modified)
+            self.state[STATE_LAST_IDS] = sorted(id_ for id_ in max_ids if id_)
+            save_state(STATE_NAME, self.state)
+        logger.info("Finished OSV fetch with %s new records", len(records))
         return len(records)
 
     def _transform(self, vuln: Dict[str, Any]) -> tuple[Optional[Dict[str, Any]], Optional[datetime]]:
@@ -91,7 +94,7 @@ class OSVFetcher(BaseFetcher):
         aliases = vuln.get("aliases", [])
 
         record = {
-            "source": self.source_name,
+            "source": STATE_NAME,
             "id": vuln_id,
             "title": summary or vuln_id,
             "description": details or summary,

@@ -6,34 +6,49 @@ import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
 
-from .base import BaseFetcher
-from .config import EnvKeys, Sources
+import requests
+
 from .common import (
+    DEFAULT_START,
+    ensure_directories,
     format_datetime,
+    load_state,
     new_ingest_timestamp,
     normalise_text,
     parse_datetime,
+    save_state,
+    write_jsonl,
 )
 
 logger = logging.getLogger(__name__)
-class MicrosoftFetcher(BaseFetcher):
-    CONFIG = Sources.MICROSOFT_MSRC
+API_URL = "https://api.msrc.microsoft.com/sug/v2.0/en-US/updates"
+STATE_NAME = "microsoft_msrc"
+STATE_LAST_RELEASE = "last_release"
+STATE_LAST_IDS = "last_ids"
+PAGE_SIZE = 100
+REQUEST_TIMEOUT = 60
 
+
+class MicrosoftFetcher:
     def __init__(self) -> None:
-        api_key = os.environ.get(EnvKeys.MSRC_API_KEY)
+        ensure_directories()
+        api_key = os.environ.get("MSRC_API_KEY")
         if not api_key:
             raise RuntimeError("MSRC_API_KEY environment variable is required")
-        super().__init__(self.CONFIG)
-        self.session.headers.update({"api-key": api_key})
-        self.last_release = self.get_last_timestamp()
-        self.last_ids: Set[str] = self.get_last_ids()
+        self.api_key = api_key
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "api-key": api_key,
+                "User-Agent": "security-fetcher/0.1",
+            }
+        )
+        self.state = load_state(STATE_NAME)
+        self.last_release = parse_datetime(self.state.get(STATE_LAST_RELEASE)) or DEFAULT_START
+        self.last_ids: Set[str] = set(self.state.get(STATE_LAST_IDS, []))
 
     def run(self) -> int:
-        logger.info(
-            "Starting %s fetch from %s",
-            self.source_name.upper(),
-            format_datetime(self.last_release),
-        )
+        logger.info("Starting MSRC fetch from %s", format_datetime(self.last_release))
         records: List[Dict[str, Any]] = []
         max_release = self.last_release
         max_ids: Set[str] = set()
@@ -41,16 +56,12 @@ class MicrosoftFetcher(BaseFetcher):
         params: Optional[Dict[str, Any]] = {
             "$filter": f"releaseDate ge {format_datetime(self.last_release - timedelta(minutes=1))}",
             "$orderby": "releaseDate",
-            "$top": self.config.page_size or 100,
+            "$top": PAGE_SIZE,
         }
 
         while True:
-            url = next_url or self.config.api_url
-            response = self.session.get(
-                url,
-                params=params if next_url is None else None,
-                timeout=self.config.request_timeout,
-            )
+            url = next_url or API_URL
+            response = self.session.get(url, params=params if next_url is None else None, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             data = response.json()
             updates = data.get("value", [])
@@ -79,13 +90,11 @@ class MicrosoftFetcher(BaseFetcher):
             params = None
 
         if records:
-            self.append_records(records)
-            self.persist_state(timestamp=max_release, ids=max_ids)
-        logger.info(
-            "Finished %s fetch with %s new records",
-            self.source_name.upper(),
-            len(records),
-        )
+            write_jsonl(STATE_NAME, records)
+            self.state[STATE_LAST_RELEASE] = format_datetime(max_release)
+            self.state[STATE_LAST_IDS] = sorted(id_ for id_ in max_ids if id_)
+            save_state(STATE_NAME, self.state)
+        logger.info("Finished MSRC fetch with %s new records", len(records))
         return len(records)
 
     def _transform(self, update: Dict[str, Any]) -> tuple[Optional[Dict[str, Any]], Optional[datetime]]:
@@ -99,7 +108,7 @@ class MicrosoftFetcher(BaseFetcher):
         patches = self._extract_patches(update)
 
         record = {
-            "source": self.source_name,
+            "source": STATE_NAME,
             "id": record_id,
             "title": normalise_text(update.get("cveTitle")) or record_id,
             "description": description,

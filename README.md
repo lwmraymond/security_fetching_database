@@ -16,8 +16,7 @@ records.
    pip install -r requirements.txt
    ```
 
-3. Export credentials for the authenticated data sources (all environment
-   variable names are centralised in `fetchers/config.py`):
+3. Export credentials for the authenticated data sources:
 
    | Source   | Environment variables |
    |----------|----------------------|
@@ -46,26 +45,6 @@ The first execution seeds the incremental state at `2025-01-01T00:00:00Z`. Every
 subsequent run resumes from the latest `modified`/`published` timestamp that was
 processed and avoids writing duplicate records even when upstream APIs return
 updated entries with the same timestamp.
-
-## Running all fetchers together
-
-To execute every fetcher sequentially and obtain a quick summary of how many
-records were collected, run the package entry-point:
-
-```bash
-python -m fetchers
-```
-
-Failures for individual sources are logged while the remaining fetchers
-continue to run. The orchestration logic is implemented in
-`fetchers/runner.py`.
-
-## Configuration reference
-
-Common constants such as API endpoints, page sizes, incremental state keys, and
-required environment variables are defined in `fetchers/config.py`. Adjust the
-values there if you need to point at alternative endpoints or tweak request
-timeouts for specific vendors.
 
 ## Output schema
 

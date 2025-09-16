@@ -8,36 +8,45 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
 
-from .base import BaseFetcher
-from .config import EnvKeys, Sources
 from .common import (
+    DEFAULT_START,
+    ensure_directories,
     format_datetime,
+    load_state,
     new_ingest_timestamp,
     normalise_text,
     parse_datetime,
+    save_state,
+    write_jsonl,
 )
 
 logger = logging.getLogger(__name__)
-class CiscoFetcher(BaseFetcher):
-    CONFIG = Sources.CISCO
+TOKEN_URL = "https://cloudsso.cisco.com/as/token.oauth2"
+API_URL = "https://api.cisco.com/security/advisories/all"
+STATE_NAME = "cisco"
+STATE_LAST_PUBLISHED = "last_published"
+STATE_LAST_IDS = "last_ids"
+PAGE_SIZE = 50
+REQUEST_TIMEOUT = 60
 
+
+class CiscoFetcher:
     def __init__(self) -> None:
-        client_id = os.environ.get(EnvKeys.CISCO_CLIENT_ID)
-        client_secret = os.environ.get(EnvKeys.CISCO_CLIENT_SECRET)
+        ensure_directories()
+        client_id = os.environ.get("CISCO_CLIENT_ID")
+        client_secret = os.environ.get("CISCO_CLIENT_SECRET")
         if not client_id or not client_secret:
             raise RuntimeError("CISCO_CLIENT_ID and CISCO_CLIENT_SECRET environment variables are required")
-        super().__init__(self.CONFIG)
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "security-fetcher/0.1"})
         self.client_id = client_id
         self.client_secret = client_secret
-        self.last_published = self.get_last_timestamp()
-        self.last_ids: Set[str] = self.get_last_ids()
+        self.state = load_state(STATE_NAME)
+        self.last_published = parse_datetime(self.state.get(STATE_LAST_PUBLISHED)) or DEFAULT_START
+        self.last_ids: Set[str] = set(self.state.get(STATE_LAST_IDS, []))
 
     def run(self) -> int:
-        logger.info(
-            "Starting %s fetch from %s",
-            self.source_name.upper(),
-            format_datetime(self.last_published),
-        )
+        logger.info("Starting Cisco fetch from %s", format_datetime(self.last_published))
         token = self._obtain_token()
         headers = {"Authorization": f"Bearer {token}"}
         records: List[Dict[str, Any]] = []
@@ -46,16 +55,16 @@ class CiscoFetcher(BaseFetcher):
         next_url: Optional[str] = None
         params: Optional[Dict[str, Any]] = {
             "last_published": (self.last_published - timedelta(days=1)).date().isoformat(),
-            "limit": self.config.page_size or 50,
+            "limit": PAGE_SIZE,
         }
 
         while True:
-            url = next_url or self.config.api_url
+            url = next_url or API_URL
             response = self.session.get(
                 url,
                 headers=headers,
                 params=params if next_url is None else None,
-                timeout=self.config.request_timeout,
+                timeout=REQUEST_TIMEOUT,
             )
             response.raise_for_status()
             data = response.json()
@@ -88,24 +97,19 @@ class CiscoFetcher(BaseFetcher):
             params = None
 
         if records:
-            self.append_records(records)
-            self.persist_state(timestamp=max_published, ids=max_ids)
-        logger.info(
-            "Finished %s fetch with %s new records",
-            self.source_name.upper(),
-            len(records),
-        )
+            write_jsonl(STATE_NAME, records)
+            self.state[STATE_LAST_PUBLISHED] = format_datetime(max_published)
+            self.state[STATE_LAST_IDS] = sorted(id_ for id_ in max_ids if id_)
+            save_state(STATE_NAME, self.state)
+        logger.info("Finished Cisco fetch with %s new records", len(records))
         return len(records)
 
     def _obtain_token(self) -> str:
-        token_url = self.config.token_url
-        if not token_url:
-            raise RuntimeError("Cisco token URL is not configured")
         response = requests.post(
-            token_url,
+            TOKEN_URL,
             data={"grant_type": "client_credentials"},
             auth=(self.client_id, self.client_secret),
-            timeout=self.config.request_timeout,
+            timeout=REQUEST_TIMEOUT,
         )
         response.raise_for_status()
         token_data = response.json()
@@ -122,7 +126,7 @@ class CiscoFetcher(BaseFetcher):
         products = advisory.get("productNames", [])
         references = self._extract_references(advisory)
         base_record = {
-            "source": self.source_name,
+            "source": STATE_NAME,
             "advisory_id": advisory_id,
             "title": summary or advisory_id,
             "description": summary,
