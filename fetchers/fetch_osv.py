@@ -20,8 +20,8 @@ from .common import (
 )
 
 logger = logging.getLogger(__name__)
-API_URL = "https://api.osv.dev/v1/vulns"
-STATE_NAME = "osv"
+API_URL = "https://api.osv.dev/v1/vulns" # this URL is not officially documented -> should be replaced by ?
+STATE_NAME = "osv" 
 STATE_LAST_MODIFIED = "last_modified"
 STATE_LAST_IDS = "last_ids"
 PAGE_SIZE = 100
@@ -52,7 +52,7 @@ class OSVFetcher:
             response = self.session.get(API_URL, params=params, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             data = response.json()
-            vulns = data.get("vulns") or data.get("results") or []
+            vulns = data.get("vulns") or data.get("results") or []  # get results from API response
             if not vulns:
                 break
 

@@ -15,9 +15,9 @@ FetcherType = Type[BaseFetcher]
 FETCHER_CLASSES: Tuple[FetcherType, ...] = (
     NvdFetcher,
     OSVFetcher,
-    GitHubFetcher,
-    MicrosoftFetcher,
-    CiscoFetcher,
+    # GitHubFetcher,
+    # MicrosoftFetcher,
+    # CiscoFetcher,
 )
 
 
@@ -39,13 +39,9 @@ def run_all(fetcher_classes: Iterable[FetcherType] = FETCHER_CLASSES) -> Dict[st
         try:
             count = fetcher.run()
         except Exception:
-            logging.exception("Fetcher %s failed", fetcher.source_name)
-            results[fetcher.source_name] = -1
+            logging.exception("Fetcher %s failed", fetcher_cls.__name__)
+            results[fetcher_cls.__name__] = -1
         else:
-            results[fetcher.source_name] = count
-        finally:
-            try:
-                fetcher.session.close()
-            except Exception:
-                pass
+            results[fetcher_cls.__name__] = count
+
     return results
